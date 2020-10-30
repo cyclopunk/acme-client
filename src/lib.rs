@@ -281,7 +281,12 @@ extern crate serde;
 extern crate serde_json;
 extern crate base64;
 
-use std::path::Path;
+use openssl::sha::sha256;
+use serde_json::from_value;
+use hyper::header::Location;
+use reqwest::mime::Mime;
+use reqwest::header::ContentType;
+use std::{path::Path, io::stdin};
 use std::fs::File;
 use std::io::{Read, Write};
 use std::collections::HashMap;
@@ -297,10 +302,10 @@ use helper::{gen_key, b64, read_pkey, gen_csr};
 use error::{Result, ErrorKind};
 
 use serde_json::{Value, from_str, to_string, to_value};
-use serde::Serialize;
+use serde::{Serialize, Deserialize};
 
 /// Default Let's Encrypt directory URL to configure client.
-pub const LETSENCRYPT_DIRECTORY_URL: &'static str = "https://acme-v01.api.letsencrypt.org\
+pub const LETSENCRYPT_DIRECTORY_URL: &'static str = "https://acme-v02.api.letsencrypt.org\
                                                      /directory";
 /// Default Let's Encrypt agreement URL used in account registration.
 pub const LETSENCRYPT_AGREEMENT_URL: &'static str = "https://letsencrypt.org/documents/LE-SA-v1.2-\
@@ -331,6 +336,25 @@ pub struct Directory {
 pub struct Account {
     directory: Directory,
     pkey: PKey<openssl::pkey::Private>,
+    pkey_id: Option<String>
+}
+
+#[derive(Deserialize, Debug, Clone)]
+/// A verification challenge.
+pub struct Challenge {
+    #[serde(skip)]
+    auth : Option<Authorization>,
+    /// Type of verification challenge. Usually `http-01`, `dns-01` for letsencrypt.
+    #[serde(rename = "type")]
+    ctype: String,
+    /// URL to trigger challenge.
+    url: String,
+    /// Challenge token.
+    token: String,
+    /// Key authorization.
+    status: String,
+    #[serde(skip)]
+    key_authorization: String
 }
 
 
@@ -355,27 +379,16 @@ pub struct CertificateSigner<'a> {
 
 /// A signed certificate.
 pub struct SignedCertificate {
-    cert: X509,
+    certs: Vec<X509>,
     csr: X509Req,
     pkey: PKey<openssl::pkey::Private>,
 }
 
 
 /// Identifier authorization object.
-pub struct Authorization<'a>(Vec<Challenge<'a>>);
-
-
-/// A verification challenge.
-pub struct Challenge<'a> {
-    account: &'a Account,
-    /// Type of verification challenge. Usually `http-01`, `dns-01` for letsencrypt.
-    ctype: String,
-    /// URL to trigger challenge.
-    url: String,
-    /// Challenge token.
-    token: String,
-    /// Key authorization.
-    key_authorization: String,
+#[derive(Clone,Debug)]
+pub struct Authorization {
+    url: String
 }
 
 
@@ -449,7 +462,7 @@ impl Directory {
     /// This function will try to look for `new-nonce` key in directory if it doesn't exists
     /// it will try to get nonce header from directory url.
     fn get_nonce(&self) -> Result<String> {
-        let url = self.url_for("new-nonce").unwrap_or(&self.url);
+        let url = self.url_for("newNonce").unwrap_or(&self.url);
         let client = Client::new()?;
         let res = client.get(url).send()?;
         res.headers()
@@ -462,7 +475,7 @@ impl Directory {
     ///
     /// Returns status code and Value object from reply.
     fn request<T: Serialize>(&self,
-                             pkey: &PKey<openssl::pkey::Private>,
+                             account:&Account,
                              resource: &str,
                              payload: T)
                              -> Result<(StatusCode, Value)> {
@@ -473,41 +486,56 @@ impl Directory {
         json.as_object_mut()
             .and_then(|obj| obj.insert("resource".to_owned(), resource_json));
 
-        let jws = self.jws(pkey, json)?;
+        let url = self.url_for(resource).unwrap_or(resource);
+        let jws = self.jws(url, account, json)?;
         let client = Client::new()?;
         let mut res = client
-            .post(self.url_for(resource)
-                      .ok_or(format!("URL for resource: {} not found", resource))?)
+            .post(url)
+            .header(ContentType("application/jose+json".parse().unwrap()))
             .body(&jws[..])
             .send()?;
-
-        let res_json = {
+        //println!("{:?}",res);
+        let mut res_json = {
             let mut res_content = String::new();
             res.read_to_string(&mut res_content)?;
-            if !res_content.is_empty() {
-                from_str(&res_content)?
+            if !res_content.is_empty() {    
+                let json :HashMap<String, Value> = from_str(&res_content)?;
+                to_value(json)?
             } else {
                 to_value(true)?
             }
         };
+        if let Some(loc) = res.headers().get::<Location>() {            
+            let val = to_value(loc.to_string())?;
+
+            res_json
+                .as_object_mut()
+                .and_then(|map| map.insert("location".into(), val));
+        }
 
         Ok((*res.status(), res_json))
     }
 
     /// Makes a Flattened JSON Web Signature from payload
-    fn jws<T: Serialize>(&self, pkey: &PKey<openssl::pkey::Private>, payload: T) -> Result<String> {
+    fn jws<T: Serialize>(&self, url: &str, account: &Account, payload: T) -> Result<String> {
         let nonce = self.get_nonce()?;
         let mut data: HashMap<String, Value> = HashMap::new();
 
         // header: 'alg': 'RS256', 'jwk': { e, n, kty }
         let mut header: HashMap<String, Value> = HashMap::new();
         header.insert("alg".to_owned(), to_value("RS256")?);
-        header.insert("jwk".to_owned(), self.jwk(pkey)?);
-        data.insert("header".to_owned(), to_value(&header)?);
+        header.insert("url".to_owned(), to_value(url)?);
+        if let Some(kid) = account.pkey_id.clone() {
+            header.insert("kid".to_owned(), to_value(kid)?);
+        } else {
+            header.insert("jwk".to_owned(), self.jwk(&account.pkey)?);
+        }
+        //data.insert("header".to_owned(), to_value(&header)?);
 
         // payload: b64 of payload
         let payload = to_string(&payload)?;
-        let payload64 = b64(&payload.into_bytes());
+        //println!("Payload: {}", payload);
+        let payload64 = if payload == "\"\"" {"".to_string()} else { b64(&payload.into_bytes())};
         data.insert("payload".to_owned(), to_value(&payload64)?);
 
         // protected: base64 of header + nonce
@@ -517,13 +545,14 @@ impl Directory {
 
         // signature: b64 of hash of signature of {proctected64}.{payload64}
         data.insert("signature".to_owned(), {
-            let mut signer = Signer::new(MessageDigest::sha256(), &pkey)?;
+            let mut signer = Signer::new(MessageDigest::sha256(), &account.pkey)?;
             signer
                 .update(&format!("{}.{}", protected64, payload64).into_bytes())?;
             to_value(b64(&signer.sign_to_vec()?))?
         });
 
         let json_str = to_string(&data)?;
+        //println!("{}", json_str);
         Ok(json_str)
     }
 
@@ -536,76 +565,76 @@ impl Directory {
         jwk.insert("kty".to_owned(), "RSA".to_owned());
         jwk.insert("n".to_owned(),
                    b64(&rsa.n().to_vec()));
+        //println!("{}",to_value(&jwk)?);
         Ok(to_value(jwk)?)
     }
 }
 
-
-
+pub struct CreateOrder {
+    finalize_url: String,
+    pub challenges: Vec<Challenge>,
+    pub domains: Vec<String>
+}
 
 impl Account {
     /// Creates a new identifier authorization object for domain
-    pub fn authorization<'a>(&'a self, domain: &str) -> Result<Authorization<'a>> {
+    pub fn create_order<'a>(&'a self, domain: &str) -> Result<CreateOrder> {
         info!("Sending identifier authorization request for {}", domain);
 
+        let mut challenges: Vec<Challenge> = Vec::new();
+
         let mut map = HashMap::new();
-        map.insert("identifier".to_owned(), {
+        map.insert("identifiers".to_owned(), {            
             let mut map = HashMap::new();
             map.insert("type".to_owned(), "dns".to_owned());
             map.insert("value".to_owned(), domain.to_owned());
-            map
+            vec![map]
         });
-        let (status, resp) = self.directory().request(self.pkey(), "new-authz", map)?;
-
+        let (status, resp) = self.directory()
+            .request(self, "newOrder", map)?;
+        
+//        println!("status: {} resp: {}",status, resp);
+        
         if status != StatusCode::Created {
             return Err(ErrorKind::AcmeServerError(resp).into());
         }
 
-        let mut challenges = Vec::new();
-        for challenge in resp.as_object()
-                .and_then(|obj| obj.get("challenges"))
-                .and_then(|c| c.as_array())
-                .ok_or("No challenge found")? {
+        let authorizations : Option<Vec<Authorization>> = resp.get("authorizations").and_then(|auth| {
+            let mut auths = auth.as_array().unwrap();
+            Some(auths.iter().map(|a| Authorization { url: a.as_str().unwrap().to_string() }).collect())            
+        });
+      
+        //println!("{:?}",authorizations);
 
-            let obj = challenge
-                .as_object()
-                .ok_or("Challenge object not found")?;
+        for auth in authorizations.unwrap() {
+            let m: HashMap<String,Value> = HashMap::new();
+            
+            let (status, resp) = self.directory()
+                .request(self, &auth.url,  "")?;
+            //println!("{:?}", resp);
+            
+            for challenge in resp.get("challenges").unwrap().as_array().unwrap() {
+                let mut chal : Challenge = from_value(challenge.clone()).unwrap();
+                let key_authorization = format!("{}.{}",
+                chal.token,
+                b64(&hash(MessageDigest::sha256(),
+                           &to_string(&self.directory()
+                                           .jwk(self.pkey())?)?
+                                    .into_bytes())?));
+                chal.key_authorization = key_authorization.clone();
+                chal.auth = Some(auth.clone());
+                challenges.push(chal);
+            }
 
-            let ctype = obj.get("type")
-                .and_then(|t| t.as_str())
-                .ok_or("Challenge type not found")?
-                .to_owned();
-            let uri = obj.get("uri")
-                .and_then(|t| t.as_str())
-                .ok_or("URI not found")?
-                .to_owned();
-            let token = obj.get("token")
-                .and_then(|t| t.as_str())
-                .ok_or("Token not found")?
-                .to_owned();
-
-            // This seems really cryptic but it's not
-            // https://tools.ietf.org/html/draft-ietf-acme-acme-05#section-7.1
-            // key-authz = token || '.' || base64url(JWK\_Thumbprint(accountKey))
-            let key_authorization = format!("{}.{}",
-                                            token,
-                                            b64(&hash(MessageDigest::sha256(),
-                                                       &to_string(&self.directory()
-                                                                       .jwk(self.pkey())?)?
-                                                                .into_bytes())?));
-
-            let challenge = Challenge {
-                account: self,
-                ctype: ctype,
-                url: uri,
-                token: token,
-                key_authorization: key_authorization,
-            };
-            challenges.push(challenge);
+            
         }
-
-        Ok(Authorization(challenges))
-    }
+        
+        Ok(CreateOrder {
+            finalize_url: resp.get("finalize").unwrap().as_str().unwrap().to_string(),
+            challenges: challenges,
+            domains:vec![domain.to_string()]
+        })
+    }       
 
     /// Creates a new `CertificateSigner` helper to sign a certificate for list of domains.
     ///
@@ -642,7 +671,7 @@ impl Account {
             map.insert("certificate".to_owned(), b64(&cert.to_der()?));
 
             self.directory()
-                .request(self.pkey(), "revoke-cert", map)?
+                .request(self, "revoke-cert", map)?
         };
 
         match status {
@@ -716,32 +745,29 @@ impl AccountRegistration {
     pub fn register(self) -> Result<Account> {
         info!("Registering account");
         let mut map = HashMap::new();
-        map.insert("agreement".to_owned(),
-                   to_value(self.agreement
-                                .unwrap_or(LETSENCRYPT_AGREEMENT_URL.to_owned()))?);
-        if let Some(mut contact) = self.contact {
-            if let Some(email) = self.email {
-                contact.push(format!("mailto:{}", email));
-            }
-            map.insert("contract".to_owned(), to_value(contact)?);
-        } else if let Some(email) = self.email {
-            map.insert("contract".to_owned(),
-                       to_value(vec![format!("mailto:{}", email)])?);
-        }
+       
+        map.insert("termsOfServiceAgreed", true);
 
         let pkey = self.pkey.unwrap_or(gen_key()?);
-        let (status, resp) = self.directory.request(&pkey, "new-reg", map)?;
+        let mut account = Account {
+            directory: self.directory,
+            pkey_id: None, 
+            pkey: pkey,
+        };
+        let (status, resp) = account.directory.request(&account, "newAccount", map)?;
+
+        //println!("status: {} resp: {}", status, resp);
 
         match status {
             StatusCode::Created => debug!("User successfully registered"),
+            StatusCode::Ok => debug!("User successfully received"),
             StatusCode::Conflict => debug!("User already registered"),
             _ => return Err(ErrorKind::AcmeServerError(resp).into()),
         };
 
-        Ok(Account {
-               directory: self.directory,
-               pkey: pkey,
-           })
+        account.pkey_id = Some(resp.get("location").unwrap().as_str().unwrap().into());
+
+        Ok(account)
     }
 }
 
@@ -785,42 +811,61 @@ impl<'a> CertificateSigner<'a> {
     /// Signs certificate.
     ///
     /// CSR and PKey will be generated if it doesn't set or loaded first.
-    pub fn sign_certificate(self) -> Result<SignedCertificate> {
+    pub fn sign_certificate(self, order : &CreateOrder) -> Result<SignedCertificate> {
         info!("Signing certificate");
-        let pkey = self.pkey.unwrap_or(gen_key()?);
-        let csr = self.csr.unwrap_or(gen_csr(&pkey, self.domains)?);
-        let mut map = HashMap::new();
-        map.insert("resource".to_owned(), "new-cert".to_owned());
-        map.insert("csr".to_owned(), b64(&csr.to_der()?));
-
-        let client = Client::new()?;
-        let jws = self.account.directory().jws(self.account.pkey(), map)?;
-        let mut res = client
-            .post(self.account
-                      .directory()
-                      .url_for("new-cert")
-                      .ok_or("new-cert url not found")?)
-            .body(&jws[..])
-            .send()?;
-
-        if res.status() != &StatusCode::Created {
+        let domains: Vec<&str> = order.domains.iter().map(|s| &s[..]).collect();
+        let s_key = gen_key().unwrap();
+        let csr = gen_csr(&s_key, &domains).unwrap();
+        let csr_payload = to_value({
+            let mut map : HashMap<String,Value> = HashMap::new();                    
+            map.insert("csr".into(), to_value(&b64(&csr.to_der().unwrap())).unwrap());
+            map
+        }).unwrap();
+        let client = Client::new().unwrap();
+        let mut resp = client
+            .post(&order.finalize_url)
+            .header(ContentType("application/jose+json".parse().unwrap()))
+            .body({                        
+                self.account.directory().jws(&order.finalize_url,&self.account, csr_payload).unwrap()
+            })
+            .send().unwrap();
+        
+        if resp.status() != &StatusCode::Ok {
             let res_json = {
                 let mut res_content = String::new();
-                res.read_to_string(&mut res_content)?;
+                resp.read_to_string(&mut res_content)?;
                 from_str(&res_content)?
             };
             return Err(ErrorKind::AcmeServerError(res_json).into());
         }
 
-        let mut crt_der = Vec::new();
-        res.read_to_end(&mut crt_der)?;
-        let cert = X509::from_der(&crt_der)?;
+        let fr : FinalizeResponse = {
+            let mut res_content = String::new();
+            resp.read_to_string(&mut res_content)?;
+            from_str(&res_content)?
+        };
+        
+        let mut cert_resp = client
+        .post(&fr.certificate)
+        .header(ContentType("application/jose+json".parse().unwrap()))
+        .body({                        
+            self.account.directory().jws(&fr.certificate,&self.account, "").unwrap()
+        })
+        .send().unwrap();
+
+
+        let mut crt_der = String::new();
+        cert_resp.read_to_string(&mut crt_der)?;
+        
+        println!("{:?}", crt_der);
+
+        let cert = X509::stack_from_pem(&crt_der.as_bytes())?;
 
         debug!("Certificate successfully signed");
         Ok(SignedCertificate {
-               cert: cert,
+               certs: cert,
                csr: csr,
-               pkey: pkey,
+               pkey: s_key,
            })
     }
 }
@@ -873,7 +918,9 @@ impl SignedCertificate {
 
     /// Writes signed certificate to writer.
     pub fn write_signed_certificate<W: Write>(&self, writer: &mut W) -> Result<()> {
-        writer.write_all(&self.cert.to_pem()?)?;
+        for cert in self.cert() {
+            writer.write_all(&cert.to_pem()?)?;
+        }
         Ok(())
     }
 
@@ -915,8 +962,8 @@ impl SignedCertificate {
     }
 
     /// Returns reference to certificate
-    pub fn cert(&self) -> &X509 {
-        &self.cert
+    pub fn cert(&self) -> &Vec<X509> {
+        &self.certs
     }
 
     /// Returns reference to CSR used to sign certificate
@@ -931,16 +978,17 @@ impl SignedCertificate {
 }
 
 
-impl<'a> Authorization<'a> {
+impl<'a> Authorization {
     /// Gets a challenge.
     ///
     /// Pattern is used in `starts_with` for type comparison.
     pub fn get_challenge(&self, pattern: &str) -> Option<&Challenge> {
+        /*
         for challenge in &self.0 {
             if challenge.ctype().starts_with(pattern) {
                 return Some(challenge);
             }
-        }
+        }*/
         None
     }
 
@@ -960,8 +1008,39 @@ impl<'a> Authorization<'a> {
     }
 }
 
+#[derive(Deserialize, Debug, Clone)]
+struct Identifier {
+    #[serde(rename = "type")]
+    itype: String,
+    value: String
+}
 
-impl<'a> Challenge<'a> {
+#[derive(Deserialize, Debug, Clone)]
+struct AuthResponse {
+    status: String,
+    expires: String,    
+    identifier: Identifier,
+    challenges: Vec<Challenge>
+}
+#[derive(Deserialize, Debug, Clone)]
+struct FinalizeResponse {
+    status: String,
+    finalize: String,
+    certificate:String,
+    expires: String,    
+    authorizations:Vec<String>,
+    identifiers: Vec<Identifier>
+}
+
+impl AuthResponse {
+    pub fn get_dns_challenge(&self) -> Challenge {
+        let matches: Vec<Challenge> = self.challenges.iter().cloned().filter(|p| p.ctype == "dns-01").collect();
+        
+        matches.first().unwrap().clone()
+    }
+}
+
+impl Challenge {
     /// Saves key authorization into `{path}/.well-known/acme-challenge/{token}` for http challenge.
     pub fn save_key_authorization<P: AsRef<Path>>(&self, path: P) -> Result<()> {
         use std::fs::create_dir_all;
@@ -970,7 +1049,7 @@ impl<'a> Challenge<'a> {
         create_dir_all(&path)?;
 
         let mut file = File::create(path.join(&self.token))?;
-        writeln!(&mut file, "{}", self.key_authorization)?;
+        //writeln!(&mut file, "{}", self.key_authorization)?;
 
         Ok(())
     }
@@ -982,6 +1061,7 @@ impl<'a> Challenge<'a> {
     pub fn signature(&self) -> Result<String> {
         Ok(b64(&hash(MessageDigest::sha256(),
                      &self.key_authorization.clone().into_bytes())?))
+        
     }
 
     /// Returns challenge type, usually `http-01` or `dns-01` for Let's Encrypt.
@@ -1000,8 +1080,12 @@ impl<'a> Challenge<'a> {
     }
 
     /// Triggers validation.
-    pub fn validate(&self) -> Result<()> {
-        info!("Triggering {} validation", self.ctype);
+    pub fn validate(&self, account: &Account, domain: &str) -> Result<()> {
+        let mut string = String::new();
+        println!("Signature: {}", self.signature().unwrap());
+        stdin().read_line(&mut string).expect("Hit Enter to continue");
+
+        println!("Triggering {} validation", self.ctype);
         let payload = {
             let map = {
                 let mut map: HashMap<String, Value> = HashMap::new();
@@ -1009,45 +1093,54 @@ impl<'a> Challenge<'a> {
                 map.insert("token".to_owned(), to_value(&self.token)?);
                 map.insert("resource".to_owned(), to_value("challenge")?);
                 map.insert("keyAuthorization".to_owned(),
-                           to_value(&self.key_authorization)?);
+                           to_value(&self.key_authorization())?);
                 map
             };
-            self.account.directory().jws(self.account.pkey(), map)?
+            account.directory().jws(&self.url,account, map)?
         };
 
         let client = Client::new()?;
-        let mut resp = client.post(&self.url).body(&payload[..]).send()?;
+        let mut resp = client.post(&self.url)
+            .header(ContentType("application/jose+json".parse().unwrap()))
+            .body(&payload[..]).send()?;
 
-        let mut res_json: Value = {
-            let mut res_content = String::new();
-            resp.read_to_string(&mut res_content)?;
-            from_str(&res_content)?
-        };
+        let mut res_content = String::new();
+        
+        resp.read_to_string(&mut res_content)?;
 
-        if resp.status() != &StatusCode::Accepted {
-            return Err(ErrorKind::AcmeServerError(res_json).into());
+        println!("{}", res_content);
+
+        let mut auth : Challenge = serde_json::from_str(&res_content[..]).unwrap();
+        auth.key_authorization = self.key_authorization().to_string();
+        
+        if resp.status() != &StatusCode::Accepted && resp.status() != &StatusCode::Ok {
+            return Err(ErrorKind::Msg("Unacceptable status when trying to validate".to_string()).into());
         }
 
         loop {
-            let status = res_json
-                .as_object()
-                .and_then(|o| o.get("status"))
-                .and_then(|s| s.as_str())
-                .ok_or("Status not found")?
-                .to_owned();
+            let status = &auth.status;
 
             if status == "pending" {
                 debug!("Status is pending, trying again...");
-                let mut resp = client.get(&self.url).send()?;
-                res_json = {
+                let mut resp = client
+                    .post(&auth.url)
+                    .header(ContentType("application/jose+json".parse().unwrap()))
+                    .body({                        
+                        account.directory().jws(&auth.url,account, "")?
+                    })
+                    .send()?;
+
                     let mut res_content = String::new();
                     resp.read_to_string(&mut res_content)?;
-                    from_str(&res_content)?
-                };
+                    println!("{}", res_content);
+                    auth = serde_json::from_str(&res_content)?;
+
             } else if status == "valid" {
+                
+                
                 return Ok(());
             } else if status == "invalid" {
-                return Err(ErrorKind::AcmeServerError(res_json).into());
+                return Err(ErrorKind::Msg("Invalid response.".into()).into());
             }
 
             use std::thread::sleep;
@@ -1200,13 +1293,12 @@ mod tests {
     extern crate env_logger;
     use super::*;
 
-    const LETSENCRYPT_STAGING_DIRECTORY_URL: &'static str = "https://acme-staging.api.letsencrypt.\
-                                                             org/directory";
+    const LETSENCRYPT_STAGING_DIRECTORY_URL: &'static str = "https://acme-staging-v02.api.letsencrypt.org/directory";
 
     fn test_acc() -> Result<Account> {
         Directory::from_url(LETSENCRYPT_STAGING_DIRECTORY_URL)?
             .account_registration()
-            .pkey_from_file("tests/user.key")?
+            .pkey_from_file("tests/private.key").unwrap()
             .register()
     }
 
@@ -1222,7 +1314,7 @@ mod tests {
 
     #[test]
     fn test_read_pkey() {
-        assert!(read_pkey("tests/user.key").is_ok());
+        assert!(read_pkey("tests/private.key").is_ok());
     }
 
     #[test]
@@ -1237,45 +1329,50 @@ mod tests {
         assert!(Directory::lets_encrypt().is_ok());
 
         let dir = Directory::from_url(LETSENCRYPT_STAGING_DIRECTORY_URL).unwrap();
-        assert!(dir.url_for("new-reg").is_some());
-        assert!(dir.url_for("new-authz").is_some());
-        assert!(dir.url_for("new-cert").is_some());
+        assert!(dir.url_for("newAccount").is_some());
+        assert!(dir.url_for("newOrder").is_some());
+        assert!(dir.url_for("newNonce").is_some());
 
         assert!(!dir.get_nonce().unwrap().is_empty());
 
         let pkey = gen_key().unwrap();
         assert!(dir.jwk(&pkey).is_ok());
-        assert!(dir.jws(&pkey, true).is_ok());
+        //assert!(dir.jws("", &pkey, true).is_ok());
     }
 
     #[test]
     fn test_account_registration() {
         let _ = env_logger::init();
+        
+        let pkey = gen_key().unwrap();
         let dir = Directory::from_url(LETSENCRYPT_STAGING_DIRECTORY_URL).unwrap();
-        assert!(dir.account_registration()
-                    .pkey_from_file("tests/user.key")
-                    .unwrap()
-                    .register()
+        let result = dir.account_registration()
+        .pkey(pkey)
+        .register();
+
+        assert!(result
                     .is_ok());
     }
 
     #[test]
-    fn test_authorization() {
+    fn test_order() {
         let _ = env_logger::init();
         let account = test_acc().unwrap();
-        let auth = account.authorization("example.com").unwrap();
-        assert!(!auth.0.is_empty());
-        assert!(auth.get_challenge("http").is_some());
-        assert!(auth.get_http_challenge().is_some());
-        assert!(auth.get_dns_challenge().is_some());
-        //assert!(auth.get_tls_sni_challenge().is_some());
-
-        for challenge in auth.0 {
-            assert!(!challenge.ctype.is_empty());
-            assert!(!challenge.url.is_empty());
-            assert!(!challenge.token.is_empty());
-            assert!(!challenge.key_authorization.is_empty());
+        let order = account.create_order("test.autobuild.cloud").unwrap();
+        let domain = "test.autobuild.cloud";
+        let domains = &[domain];
+        //println!("{:?}", order.challenges);
+        for chal in order.challenges.clone() {
+            if chal.ctype == "dns-01" {
+                chal.validate(&account, &domain).unwrap();
+            }
         }
+
+
+        let signer = account.certificate_signer(domains);
+
+        signer.sign_certificate(&order).unwrap().save_signed_certificate("tests/cert.pem")
+            .unwrap();
     }
 
     // This test requires properly configured domain name and a http server
@@ -1287,17 +1384,18 @@ mod tests {
         let _ = env_logger::init();
         let account = test_acc().unwrap();
         let auth = account
-            .authorization(&env::var("TEST_DOMAIN").unwrap())
+            .create_order(&env::var("TEST_DOMAIN").unwrap())
             .unwrap();
+            /*
         let http_challenge = auth.get_http_challenge().unwrap();
         assert!(http_challenge
                     .save_key_authorization(&env::var("TEST_PUBLIC_DIR").unwrap())
                     .is_ok());
-        assert!(http_challenge.validate().is_ok());
+        assert!(http_challenge.validate(&account).is_ok());
         let cert = account
             .certificate_signer(&[&env::var("TEST_DOMAIN").unwrap()])
             .sign_certificate()
             .unwrap();
-        account.revoke_certificate(cert.cert()).unwrap();
+        account.revoke_certificate(cert.cert()).unwrap();*/
     }
 }
