@@ -1,9 +1,7 @@
 # acme-client
 
-[![Build Status](https://secure.travis-ci.org/onur/acme-client.svg?branch=master)](https://travis-ci.org/onur/acme-client)
-[![License](https://img.shields.io/badge/license-MIT-blue.svg)](https://raw.githubusercontent.com/onur/acme-client/master/LICENSE)
-[![Crates.io](https://img.shields.io/crates/v/acme-client.svg)](https://crates.io/crates/acme-client)
-[![docs.rs.io](https://docs.rs/acme-client/badge.svg)](https://docs.rs/acme-client)
+[![Build Status](https://secure.travis-ci.org/onur/acme-client.svg?branch=master)](https://travis-ci.org/cyclopunk/acme-client)
+[![License](https://img.shields.io/badge/license-MIT-blue.svg)](https://raw.githubusercontent.com/cyclopunk/acme-client/master/LICENSE)
 
 Easy to use Let's Encrypt compatible ACME client to issue, renew and
 revoke TLS certificates.
