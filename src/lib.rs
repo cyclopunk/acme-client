@@ -494,7 +494,7 @@ impl Directory {
             .header(ContentType("application/jose+json".parse().unwrap()))
             .body(&jws[..])
             .send()?;
-        //println!("{:?}",res);
+        
         let mut res_json = {
             let mut res_content = String::new();
             res.read_to_string(&mut res_content)?;
@@ -593,7 +593,6 @@ impl Account {
         let (status, resp) = self.directory()
             .request(self, "newOrder", map)?;
         
-//        println!("status: {} resp: {}",status, resp);
         
         if status != StatusCode::Created {
             return Err(ErrorKind::AcmeServerError(resp).into());
@@ -604,15 +603,12 @@ impl Account {
             Some(auths.iter().map(|a| Authorization { url: a.as_str().unwrap().to_string() }).collect())            
         });
       
-        //println!("{:?}",authorizations);
-
         for auth in authorizations.unwrap() {
             let m: HashMap<String,Value> = HashMap::new();
             
             let (status, resp) = self.directory()
                 .request(self, &auth.url,  "")?;
-            //println!("{:?}", resp);
-            
+                
             for challenge in resp.get("challenges").unwrap().as_array().unwrap() {
                 let mut chal : Challenge = from_value(challenge.clone()).unwrap();
                 let key_authorization = format!("{}.{}",
@@ -1082,10 +1078,7 @@ impl Challenge {
     /// Triggers validation.
     pub fn validate(&self, account: &Account, domain: &str) -> Result<()> {
         let mut string = String::new();
-        println!("Signature: {}", self.signature().unwrap());
-        stdin().read_line(&mut string).expect("Hit Enter to continue");
-
-        println!("Triggering {} validation", self.ctype);
+        
         let payload = {
             let map = {
                 let mut map: HashMap<String, Value> = HashMap::new();
@@ -1132,7 +1125,7 @@ impl Challenge {
 
                     let mut res_content = String::new();
                     resp.read_to_string(&mut res_content)?;
-                    println!("{}", res_content);
+
                     auth = serde_json::from_str(&res_content)?;
 
             } else if status == "valid" {
@@ -1361,7 +1354,7 @@ mod tests {
         let order = account.create_order("test.autobuild.cloud").unwrap();
         let domain = "test.autobuild.cloud";
         let domains = &[domain];
-        //println!("{:?}", order.challenges);
+        
         for chal in order.challenges.clone() {
             if chal.ctype == "dns-01" {
                 chal.validate(&account, &domain).unwrap();
